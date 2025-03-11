@@ -1,0 +1,159 @@
+// **ENTER YOUR API KEY HERE**
+const apiKey = '6239a66d9d39f1443c1069fdaf2922eda1ff0e4d71b3d96feb3f14734efaadcf';
+
+// **START FETCHING ALL TIMEFRAMES**
+function startFetchingAllTrends() {
+  scheduleBatchExecution("90 Days", "Trends Data 90", 13, 90, true);
+}
+
+// **SCHEDULE BATCH EXECUTION FOR A TIMEFRAME**
+function scheduleBatchExecution(label, sheetName, weeks, days, startNewRun = false) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const mainSheet = ss.getSheetByName("Trends Data");
+  const lastRow = mainSheet.getLastRow();
+
+  let startIndex = startNewRun ? 3 : PropertiesService.getScriptProperties().getProperty(sheetName) || 3;
+  startIndex = parseInt(startIndex, 10);
+
+  if (startIndex >= lastRow) {
+    Logger.log(`✅ Finished fetching ${label} data.`);
+    PropertiesService.getScriptProperties().deleteProperty(sheetName);
+
+    // Move to the next timeframe
+    if (label === "90 Days") {
+      scheduleBatchExecution("180 Days", "Trends Data 180", 26, 180, true);
+    } else if (label === "180 Days") {
+      scheduleBatchExecution("365 Days", "Trends Data 365", 52, 365, true);
+    }
+    return;
+  }
+
+  const plantNames = mainSheet.getRange(startIndex, 1, lastRow - startIndex + 1, 1).getValues();
+  const uniqueIds = mainSheet.getRange(startIndex, 2, lastRow - startIndex + 1, 1).getValues();
+
+  const baseUrl = 'https://serpapi.com/search.json';
+  const geo = 'US';
+  const today = new Date();
+  const pastDate = new Date();
+  pastDate.setDate(today.getDate() - days);
+  const dateRange = `${formatDate(pastDate)} ${formatDate(today)}`;
+
+  let sheet = ss.getSheetByName(sheetName);
+  if (!sheet) {
+    sheet = ss.insertSheet(sheetName);
+  } else if (startIndex === 3) {
+    sheet.clear();
+  }
+
+  if (startIndex === 3) {
+    sheet.getRange(1, 1).setValue("Search Term");
+    sheet.getRange(1, 2).setValue("Unique ID");
+    const weeklyDates = getFormattedWeeklyDates(weeks);
+    sheet.getRange(1, 3, 1, weeklyDates.length).setValues([weeklyDates]);
+    sheet.getRange(2, 3, 1, weeklyDates.length).setValues([Array(weeklyDates.length).fill(`${label} Weekly Trend`)]);
+  }
+
+  let processedCount = 0;
+  const batchSize = 8; // Adjust for execution limits
+
+  for (let i = 0; i < plantNames.length; i++) {
+    if (processedCount >= batchSize) break;
+
+    const plantName = plantNames[i][0];
+    const plantId = uniqueIds[i][0];
+
+    if (!plantName) continue;
+
+    Logger.log(`🔍 Fetching ${label} data for ${plantName} (ID: ${plantId})`);
+
+    const apiUrl = `${baseUrl}?engine=google_trends&q=${encodeURIComponent(plantName)}&geo=${geo}&date=${dateRange}&api_key=${apiKey}`;
+    const trendData = fetchWithRetry(apiUrl, 3);
+
+    if (!trendData || trendData.length === 0) {
+      Logger.log(`❌ No data for ${plantName} in ${label}`);
+      sheet.getRange(startIndex, 1).setValue(plantName);
+      sheet.getRange(startIndex, 2).setValue(plantId);
+      sheet.getRange(startIndex, 3).setValue("No Data");
+    } else {
+      const weeklyData = getLastNWeeksData(trendData, weeks);
+      sheet.getRange(startIndex, 1).setValue(plantName);
+      sheet.getRange(startIndex, 2).setValue(plantId);
+      sheet.getRange(startIndex, 3, 1, weeks).setValues([weeklyData]);
+    }
+
+    processedCount++;
+    startIndex++;
+    Utilities.sleep(1000);
+  }
+
+  // **Save Progress & Schedule Next Batch**
+  if (startIndex < lastRow) {
+    PropertiesService.getScriptProperties().setProperty(sheetName, startIndex);
+    ScriptApp.newTrigger("resumeBatchExecution")
+      .timeBased()
+      .after(30000) // Wait 30 seconds before resuming
+      .create();
+  } else {
+    PropertiesService.getScriptProperties().deleteProperty(sheetName);
+    Logger.log(`✅ Finished fetching ${label} data.`);
+
+    // Move to the next timeframe
+    if (label === "90 Days") {
+      scheduleBatchExecution("180 Days", "Trends Data 180", 26, 180, true);
+    } else if (label === "180 Days") {
+      scheduleBatchExecution("365 Days", "Trends Data 365", 52, 365, true);
+    }
+  }
+}
+
+// **RESUME EXECUTION AFTER TIMEOUT**
+function resumeBatchExecution() {
+  const triggers = ScriptApp.getProjectTriggers();
+  for (let trigger of triggers) {
+    if (trigger.getHandlerFunction() === "resumeBatchExecution") {
+      ScriptApp.deleteTrigger(trigger);
+    }
+  }
+  startFetchingAllTrends();
+}
+
+// **FETCH API DATA WITH RETRY LOGIC**
+function fetchWithRetry(apiUrl, maxAttempts) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const response = UrlFetchApp.fetch(apiUrl);
+      const json = JSON.parse(response.getContentText());
+      if (json.interest_over_time && json.interest_over_time.timeline_data) {
+        return json.interest_over_time.timeline_data;
+      }
+    } catch (error) {
+      Logger.log(`⚠️ Attempt ${attempt} failed: ${error.message}`);
+      if (attempt === maxAttempts) return [];
+      Utilities.sleep(2000);
+    }
+  }
+}
+
+// **GET LAST N WEEKS OF DATA**
+function getLastNWeeksData(timeline, numWeeks) {
+  return timeline.slice(-numWeeks).map(entry => (entry.values && entry.values.length > 0 ? entry.values[0].value : 0));
+}
+
+// **GENERATE WEEKLY DATE HEADERS**
+function getFormattedWeeklyDates(numWeeks) {
+  const dates = [];
+  const today = new Date();
+
+  for (let i = 0; i < numWeeks; i++) {
+    const pastDate = new Date();
+    pastDate.setDate(today.getDate() - (i * 7));
+    dates.unshift(formatDate(pastDate)); 
+  }
+
+  return Array.from(new Set(dates));
+}
+
+// **FORMAT DATE AS YYYY-MM-DD**
+function formatDate(date) {
+  return date.toISOString().split('T')[0];
+}

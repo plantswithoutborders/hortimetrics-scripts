@@ -1,5 +1,5 @@
 // **ENTER YOUR API KEY HERE**
-const apiKey = '6239a66d9d39f1443c1069fdaf2922eda1ff0e4d71b3d96feb3f14734efaadcf';
+const apiKey = 'XXX';
 
 // **START FETCHING ALL TIMEFRAMES**
 function startFetchingAllTrends() {

@@ -1,0 +1,865 @@
+/**
+ * Gets the SerpAPI key, prompting the user if it's not in Script Properties,
+ * and always saving it to Script Properties after prompting.
+ * @returns {string} The SerpAPI key.
+ * @throws {Error} If the key is not found or is invalid.
+ */
+function getSerpApiKey() {
+    const scriptProperties = PropertiesService.getScriptProperties();
+    let apiKey = scriptProperties.getProperty('SERPAPI_KEY');
+
+    if (!apiKey) {
+        const ui = SpreadsheetApp.getUi();
+        const response = ui.prompt(
+            'SerpAPI Key Required',
+            'Please enter your SerpAPI key:',
+            ui.ButtonSet.OK_CANCEL
+        );
+
+        if (response.getSelectedButton() == ui.Button.OK) {
+            apiKey = response.getResponseText();
+
+            // More Robust API Key Validation
+            const apiKeyRegex = /^[a-zA-Z0-9]{32,}$/; //  at least 32 alphanumeric characters
+            if (!apiKeyRegex.test(apiKey)) {
+                ui.alert('Error', 'Invalid SerpAPI key format.  Please enter a valid key.', ui.ButtonSet.OK);
+                throw new Error('Invalid SerpAPI key format.'); // Stop execution
+            }
+
+            // Always save the key after prompting
+            scriptProperties.setProperty('SERPAPI_KEY', apiKey);
+            Logger.log("[INFO] SerpAPI key saved to Script Properties.");
+
+        } else {
+            // User cancelled - throw an error to stop execution
+            throw new Error('SerpAPI key is required to run this script.');
+        }
+    }
+
+    Logger.log("[INFO] SerpAPI key retrieved.");
+    return apiKey;
+}
+
+/**
+ * Validates SerpAPI request parameters.
+ */
+function validateSerpApiParams(params) {
+    if (!params.engine) {
+        throw new Error("Missing 'engine' parameter for SerpAPI request.");
+    }
+    const validEngines = ["google", "google_shopping", "google_product"];
+    if (!validEngines.includes(params.engine)) {
+        throw new Error(`Invalid 'engine' parameter: ${params.engine}. Must be one of: ${validEngines.join(', ')}`);
+    }
+    if (!params.q && params.engine !== "google_product") {
+        throw new Error("Missing 'q' (query) parameter for SerpAPI request.");
+    }
+    if (!params.api_key) {
+        throw new Error("Missing 'api_key' parameter for SerpAPI request.");
+    }
+    if (params.engine === "google_product" && !params.product_id) {
+        throw new Error("Missing 'product_id' parameter for google_product engine.");
+    }
+    const validGL = ["us"];
+    if (params.gl && !validGL.includes(params.gl)) {
+        throw new Error(`Invalid 'gl' parameter: ${params.gl}.  Must be one of: ${validGL.join(', ')}`);
+    }
+}
+
+/**
+ * Handles SerpAPI-specific errors.
+ */
+function handleSerpApiError(responseCode, responseText, context) {
+    let message = "[ERROR] SerpAPI Error";
+
+    if (context.searchType) {
+        message += ` (${context.searchType})`;
+    }
+    if (context.speciesName) {
+        message += ` for "${context.speciesName}"`;
+    }
+    if (context.attempt) {
+        message += `, Attempt ${context.attempt}`;
+    }
+
+    if (responseCode) {
+        message += `. HTTP Status: ${responseCode}.`;
+        if (responseCode === 400) {
+            message += " Bad Request - Check your request parameters.";
+        } else if (responseCode === 401) {
+            message += " Unauthorized - Check your API key.";
+        } else if (responseCode === 404) {
+            message += " Not Found - The requested resource was not found.";
+        } else if (responseCode === 429) {
+            message += " Too Many Requests - You've hit the SerpAPI rate limit.";
+        } else if (responseCode >= 500) {
+            message += " Internal Server Error - SerpAPI is experiencing issues.";
+        }
+    }
+
+    if (responseText) {
+        message += ` Response: ${responseText}`;
+    }
+
+    Logger.log(message);
+}
+
+/**
+ * Centralized Error Handler (for general errors).
+ */
+function handleError(error, context) {
+    let message = "[ERROR] ";
+    if (context.searchType) {
+        message += ` (${context.searchType})`;
+    }
+    if (typeof error === 'string') {
+        message += error;
+    } else {
+        message += error.message;
+    }
+
+    if (context) {
+        if (context.speciesName) message += ` Species: ${context.speciesName}.`;
+        if (context.url) message += ` URL: ${context.url}.`;
+        if (context.attempt) message += ` Attempt ${context.attempt}.`;
+    }
+
+    Logger.log(message);
+}
+
+/**
+ * Removes duplicate rows from the Results sheet.
+ */
+function removeDuplicateResults(resultsSheet) {
+    const data = resultsSheet.getDataRange().getValues();
+    const uniqueRows = new Set();
+    const newData = [];
+
+    newData.push(data[0]); // Keep header row
+
+    for (let i = 1; i < data.length; i++) {
+        const row = data[i];
+
+        let uniqueKey;
+        if (row[9]) { // product_id at index 9
+            uniqueKey = `gs:${row[9]}`;
+        } else {
+            uniqueKey = `g:${row[8]}${row[3]}`;
+        }
+
+        if (!uniqueRows.has(uniqueKey)) {
+            uniqueRows.add(uniqueKey);
+            newData.push(row);
+        }
+    }
+
+    Logger.log(`[INFO] Found ${uniqueRows.size} unique rows.`);
+    resultsSheet.clearContents();
+    resultsSheet.getRange(1, 1, newData.length, newData[0].length).setValues(newData);
+}
+
+/**
+ * Sanitizes a species name.
+ */
+function sanitizeSpeciesName(name) {
+    if (typeof name !== 'string') {
+        return "";
+    }
+    let sanitizedName = name.trim();
+    if (sanitizedName === "") {
+        return "";
+    }
+    sanitizedName = sanitizedName.replace(/[^a-zA-Z0-9\s]/g, ' ');
+    const maxLength = 100;
+    if (sanitizedName.length > maxLength) {
+        sanitizedName = sanitizedName.substring(0, maxLength);
+    }
+    return sanitizedName;
+}
+
+/**
+ * Calculates the mean of an array of numbers.
+ */
+function calculateMean(prices) {
+    if (prices.length === 0) return "";
+    const sum = prices.reduce((acc, val) => acc + val, 0);
+    return (sum / prices.length).toFixed(2);
+}
+
+/**
+ * Calculates a specific percentile of an array of numbers.
+ */
+function calculatePercentile(prices, percentile) {
+    if (prices.length === 0) return "";
+    const sortedPrices = [...prices].sort((a, b) => a - b);
+    const index = Math.ceil((percentile / 100) * sortedPrices.length) - 1;
+    return sortedPrices[index].toFixed(2);
+}
+
+/**
+ * Generates keywords from a species name.
+ */
+function generateKeywords(speciesName) {
+    return speciesName.split(" ")
+        .filter(word => !["sp", "sp."].includes(word.toLowerCase()))
+        .slice(0, 3);
+}
+
+/**
+ * Checks if a title and snippet match the search criteria (stricter).
+ */
+function isRelevantResult(title, snippet, keywords, fullSpeciesName) {
+    const lowerTitle = title.toLowerCase();
+    const lowerSnippet = snippet ? snippet.toLowerCase() : "";
+    const lowerSpeciesName = fullSpeciesName.toLowerCase();
+
+    // 1. Check for "hoya"
+    if (!lowerTitle.includes("hoya") && !lowerSnippet.includes("hoya")) {
+        return false;
+    }
+
+    // 2. Check for at least TWO keywords
+    let keywordMatches = 0;
+    for (const keyword of keywords) {
+        if (lowerTitle.includes(keyword.toLowerCase())) {
+            keywordMatches++;
+        } else if (lowerSnippet.includes(keyword.toLowerCase())) {
+            keywordMatches++;
+        }
+    }
+    if (keywordMatches < 2) {
+        return false;
+    }
+
+    // 3. Check for full species name (or close variation) in title
+    if (!lowerTitle.includes(lowerSpeciesName)) {
+      // Check for variations (e.g., without "Hoya", without last word)
+      const speciesParts = lowerSpeciesName.split(" ");
+      let shortSpeciesName = lowerSpeciesName;
+      if (speciesParts.length > 1) {
+          shortSpeciesName = speciesParts.slice(0, -1).join(" "); // Remove last word
+      }
+        if (!lowerTitle.includes(shortSpeciesName) && !lowerTitle.includes(speciesParts[speciesParts.length-1])) {
+          return false;
+        }
+    }
+
+    return true;
+}
+// --- Main Functions ---
+
+/**
+ * Analyzes Hoya prices using SerpAPI.
+ */
+function analyzeHoyaPrices() {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const inputSheet = ss.getSheetByName("Input");
+
+    // --- Results Sheet Handling ---
+    let resultsSheet = ss.getSheetByName("Results");
+    if (!resultsSheet) {
+        resultsSheet = ss.insertSheet("Results");
+        const resultsHeader = [
+            "Source", "Species", "Position", "Title", "Price", "Extracted Price", "Old Price", "Extracted Old Price",
+            "Link", "Product ID", "Product Link", "SerpAPI Product API", "Direct Link",
+            "Store Name", "Store Rating", "Store Reviews", "Source Icon",
+            "Delivery", "Discount", "Tag", "Number of Comparisons", "Comparisons Link",
+            "Snippet", "Extensions", "Thumbnail", "Full Image", "Additional Options"
+        ];
+        resultsSheet.appendRow(resultsHeader);
+    } else {
+        resultsSheet.clear();
+        const resultsHeader = [
+            "Source", "Species", "Position", "Title", "Price", "Extracted Price", "Old Price", "Extracted Old Price",
+            "Link", "Product ID", "Product Link", "SerpAPI Product API", "Direct Link",
+            "Store Name", "Store Rating", "Store Reviews", "Source Icon",
+            "Delivery", "Discount", "Tag", "Number of Comparisons", "Comparisons Link",
+            "Snippet", "Extensions", "Thumbnail", "Full Image", "Additional Options"
+        ];
+        resultsSheet.appendRow(resultsHeader);
+    }
+
+    // --- Metrics Sheet Handling ---
+    let metricsSheet = ss.getSheetByName("Metrics");
+    if (!metricsSheet) {
+        metricsSheet = ss.insertSheet("Metrics");
+        const metricsHeader = [
+            "Species", "sample_count", "mean",
+            "0_percentile", "5_percentile", "10_percentile", "15_percentile", "20_percentile",
+            "25_percentile", "30_percentile", "35_percentile", "40_percentile", "45_percentile",
+            "50_percentile", "55_percentile", "60_percentile", "65_percentile", "70_percentile",
+            "75_percentile", "80_percentile", "85_percentile", "90_percentile", "95_percentile",
+            "100_percentile"
+        ];
+        metricsSheet.appendRow(metricsHeader);
+    } else {
+        metricsSheet.clear();
+        const metricsHeader = [
+            "Species", "sample_count", "mean",
+            "0_percentile", "5_percentile", "10_percentile", "15_percentile", "20_percentile",
+            "25_percentile", "30_percentile", "35_percentile", "40_percentile", "45_percentile",
+            "50_percentile", "55_percentile", "60_percentile", "65_percentile", "70_percentile",
+            "75_percentile", "80_percentile", "85_percentile", "90_percentile", "95_percentile",
+            "100_percentile"
+        ];
+        metricsSheet.appendRow(metricsHeader);
+    }
+
+    const inputData = inputSheet.getDataRange().getValues();
+    const speciesCol = inputData[0].indexOf("Species");
+
+    if (speciesCol === -1) {
+        Logger.log("[ERROR] 'Species' column not found in Input sheet.");
+        return;
+    }
+
+    // --- Improved Species Name Handling ---
+    const speciesData = [];
+    for (let i = 1; i < inputData.length; i++) { // Start at 1 to skip header
+        const rawSpeciesName = inputData[i][speciesCol];
+        const sanitizedSpeciesName = sanitizeSpeciesName(rawSpeciesName);
+        if (sanitizedSpeciesName !== "") {
+            speciesData.push({ name: sanitizedSpeciesName, row: i + 1 }); // Store name and original row number
+        }
+    }
+
+    Logger.log("[INFO] Species to search: " + JSON.stringify(speciesData.map(s => s.name)));
+
+    const pricesBySpecies = {};
+
+    speciesData.forEach(speciesInfo => {
+        const species = speciesInfo.name;
+        const rowIndex = speciesInfo.row; // Correct row index
+        try {
+            Logger.log(`[INFO] Processing species: "${species}"`);
+            pricesBySpecies[species] = [];
+            searchGoogleShoppingWithRetries(species, resultsSheet, pricesBySpecies);
+            searchGoogleWithRetries(species, resultsSheet, pricesBySpecies);
+
+        } catch (error) {
+            Logger.log(`[ERROR] Error processing "${species}": ${error}`);
+            // Use the correct row index to write the error back to the input sheet
+            inputSheet.getRange(rowIndex, speciesCol + 2).setValue(`Error: ${error}`);
+        }
+    });
+
+    removeDuplicateResults(resultsSheet);
+    calculateAndWriteMetrics(pricesBySpecies, metricsSheet);
+}
+
+/**
+ * Searches Google Shopping using SerpAPI, with retries, caching, and pagination.
+ */
+function searchGoogleShoppingWithRetries(speciesName, resultsSheet, pricesBySpecies, nextUrl = null) {
+    const apiKey = getSerpApiKey();
+    const searchType = "Google Shopping";
+    Logger.log(`[INFO] Searching for: "${speciesName}" with ${searchType}`);
+
+    if (!speciesName) throw new Error("Species name is undefined or null.");
+
+    const keywords = generateKeywords(speciesName);
+    if (keywords.length < 1) throw new Error(`At least one valid keywords required: "${speciesName}"`);
+
+    const query = "Hoya " + keywords.join(" "); // Always include "Hoya"
+    const params = {
+        engine: "google_shopping",
+        q: query,
+        api_key: apiKey,  // Always include api_key
+        gl: "us",
+        hl: "en",
+        num: "100",
+        direct_link: "true"
+    };
+
+    validateSerpApiParams(params);
+
+    // Use nextUrl if provided, otherwise construct the initial URL
+    let url = nextUrl || "https://serpapi.com/search?" + Object.entries(params)
+        .map(([key, value]) => `${key}=${encodeURIComponent(value)}`)
+        .join("&");
+
+    // If nextUrl is provided, ensure api_key is present
+    if (nextUrl) {
+        if (!nextUrl.includes("api_key=")) {
+            // Add the api_key, handling existing parameters correctly
+            if (nextUrl.includes("?")) {
+                url = nextUrl + "&api_key=" + apiKey;
+            } else {
+                url = nextUrl + "?api_key=" + apiKey;
+            }
+        }
+    }
+
+    Logger.log(`[INFO] Request URL: ${url}`);
+
+    // --- Caching (using MD5 hash of URL) ---
+    const cache = CacheService.getScriptCache();
+    const cacheKey = "serpapi-shopping:" + Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, url).map(function(chr) {
+        return (chr + 256).toString(16).slice(-2);
+      }).join('');
+    Logger.log(`[DEBUG] Cache key: ${cacheKey}`);
+
+    const cachedData = cache.get(cacheKey);
+
+    if (cachedData) {
+        Logger.log(`[INFO] Cache hit for "${speciesName}" (${searchType})`);
+        const data = JSON.parse(cachedData);
+        processGoogleShoppingResults(speciesName, data, resultsSheet, pricesBySpecies, keywords);
+        if (data.serpapi_pagination && data.serpapi_pagination.next) {
+            Logger.log(`[INFO] More results available. Fetching next page for "${speciesName}" (${searchType})`);
+            searchGoogleShoppingWithRetries(speciesName, resultsSheet, pricesBySpecies, data.serpapi_pagination.next);
+            return;
+        }
+        return;
+    }
+
+    let attempts = 0;
+    const maxAttempts = 3;
+    let delay = 1000;
+
+    while (attempts < maxAttempts) {
+        attempts++;
+        try {
+            const response = UrlFetchApp.fetch(url);
+            const responseCode = response.getResponseCode();
+
+            if (responseCode !== 200) {
+                handleSerpApiError(responseCode, response.getContentText(), { speciesName, url, attempt: attempts, searchType });
+                if (responseCode === 429 || responseCode >= 500) {
+                    Utilities.sleep(delay);
+                    delay *= 2;
+                    continue;
+                } else {
+                    return;
+                }
+            }
+
+            const data = JSON.parse(response.getContentText());
+
+            if (data.error) {
+                handleSerpApiError(null, data.error, { speciesName, url, attempt: attempts, searchType });
+                return;
+            }
+
+            if (!data.shopping_results || !Array.isArray(data.shopping_results)) {
+                handleError("No shopping results", { speciesName, url, searchType });
+                return;
+            }
+
+            cache.put(cacheKey, JSON.stringify(data), 3600); // Cache for 1 hour
+            Logger.log(`[INFO] Cache miss for "${speciesName}" (${searchType}). Storing in cache.`);
+            processGoogleShoppingResults(speciesName, data, resultsSheet, pricesBySpecies, keywords);
+
+            if (data.serpapi_pagination && data.serpapi_pagination.next) {
+                Logger.log(`[INFO] More results available. Fetching next page for "${speciesName}" (${searchType})`);
+                searchGoogleShoppingWithRetries(speciesName, resultsSheet, pricesBySpecies, data.serpapi_pagination.next);
+                return;
+            }
+
+            return; // Success
+
+        } catch (error) {
+            Logger.log(`[WARN] Attempt ${attempts} failed for "${speciesName}" (${searchType}): ${error.message}`);
+            if (attempts === maxAttempts) {
+                handleError(error, { speciesName, url, attempt: attempts, searchType });
+            }
+            Utilities.sleep(delay);
+            delay *= 2;
+        }
+    }
+}
+
+/**
+ * Processes results from the Google Shopping API, collects prices, and applies stricter filtering.
+ */
+function processGoogleShoppingResults(speciesName, data, resultsSheet, pricesBySpecies, keywords) {
+    data.shopping_results.forEach(result => {
+        const title = result?.title ?? "";
+        const snippet = result?.snippet ?? "";
+
+        // Use the stricter filtering
+        if (isRelevantResult(title, snippet, keywords, speciesName)) {
+            let priceVal =  parseFloat(result.extracted_price);
+            if (isNaN(priceVal)) {
+                priceVal = parseFloat(result.price);
+            }
+            let oldPriceVal = parseFloat(result.extracted_old_price);
+            if (isNaN(oldPriceVal)) {
+              oldPriceVal = parseFloat(result.old_price);
+            }
+
+            if (!isNaN(priceVal)) {
+                pricesBySpecies[speciesName].push(priceVal);
+            }
+
+            const row = [
+                "Google Shopping",
+                speciesName,
+                result?.position ?? "",
+                result?.title ?? "",
+                result?.price ?? "",
+                !isNaN(priceVal) ? priceVal : "",
+                result?.old_price ?? "",
+                !isNaN(oldPriceVal) ? oldPriceVal : "",
+                result?.link ?? "",
+                result?.product_id ?? "",
+                result?.product_link ?? "",
+                result?.serpapi_product_api ?? "",
+                result?.direct_link ?? "",
+                result?.source ?? "",
+                result?.store_rating ?? "",
+                result?.store_reviews ?? "",
+                result?.source_icon ?? "",
+                result?.delivery ?? "",
+                result?.discount ?? "",
+                result?.tag ?? "",
+                result?.number_of_comparisons ?? "",
+                result?.comparison_link ?? "",
+                result?.snippet ?? "",
+                JSON.stringify(result?.extensions) ?? "",
+                result?.thumbnail ?? "",
+                result?.image ?? "",
+                JSON.stringify(result?.other_options) ?? ""
+            ];
+            resultsSheet.appendRow(row);
+        }
+    });
+}
+
+/**
+ * Searches Google Search using SerpAPI, with retries, caching, and pagination.
+ */
+function searchGoogleWithRetries(speciesName, resultsSheet, pricesBySpecies, nextUrl = null) {
+    const apiKey = getSerpApiKey();
+    const searchType = "Google Search";
+    Logger.log(`[INFO] Searching for: "${speciesName}" with ${searchType}`);
+
+    if (!speciesName) throw new Error("Species name is undefined or null.");
+
+    const keywords = generateKeywords(speciesName);
+    if (keywords.length < 1) throw new Error(`At least one valid keywords required: "${speciesName}"`);
+
+    const query = `"${keywords.join(" ")}" "hoya" for sale -site:ebay.com -site:etsy.com -site:amazon.com`;
+    const params = {
+        engine: "google",
+        q: query,
+        api_key: apiKey, // Always include api_key
+        gl: "us",
+        hl: "en",
+        num: "100",
+    };
+
+    validateSerpApiParams(params);
+
+    let url = nextUrl || "https://serpapi.com/search?" + Object.entries(params)
+        .map(([key, value]) => `${key}=${encodeURIComponent(value)}`)
+        .join("&");
+
+    // If nextUrl is provided, ensure api_key is present
+    if (nextUrl) {
+        if (!nextUrl.includes("api_key=")) {
+            // Add the api_key, handling existing parameters correctly
+            if (nextUrl.includes("?")) {
+                url = nextUrl + "&api_key=" + apiKey;
+            } else {
+                url = nextUrl + "?api_key=" + apiKey;
+            }
+        }
+    }
+    Logger.log(`[INFO] Request URL: ${url}`);
+
+    // --- Caching (using MD5 hash of URL) ---
+    const cache = CacheService.getScriptCache();
+    const cacheKey = "serpapi-google:" + Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, url).map(function(chr) {
+        return (chr + 256).toString(16).slice(-2);
+      }).join('');
+    Logger.log(`[DEBUG] Cache key: ${cacheKey}`);
+
+    const cachedData = cache.get(cacheKey);
+
+    if (cachedData) {
+        Logger.log(`[INFO] Cache hit for "${speciesName}" (${searchType})`);
+        const data = JSON.parse(cachedData);
+        processGoogleSearchResults(speciesName, data, resultsSheet, pricesBySpecies);
+        if (data.serpapi_pagination && data.serpapi_pagination.next) {
+            Logger.log(`[INFO] More results available. Fetching next page for "${speciesName}" (${searchType})`);
+            searchGoogleWithRetries(speciesName, resultsSheet, pricesBySpecies, data.serpapi_pagination.next);
+            return;
+        }
+        return;
+    }
+
+    let attempts = 0;
+    const maxAttempts = 3;
+    let delay = 1000;
+
+    while (attempts < maxAttempts) {
+        attempts++;
+        try {
+            const response = UrlFetchApp.fetch(url);
+            const responseCode = response.getResponseCode();
+
+            if (responseCode !== 200) {
+                handleSerpApiError(responseCode, response.getContentText(), { speciesName, url, attempt: attempts, searchType });
+                if (responseCode === 429 || responseCode >= 500) {
+                    Utilities.sleep(delay);
+                    delay *= 2;
+                    continue;
+                } else {
+                    return;
+                }
+            }
+
+            const data = JSON.parse(response.getContentText());
+
+            if (data.error) {
+                handleSerpApiError(null, data.error, { speciesName, url, attempt: attempts, searchType });
+                return;
+            }
+
+            cache.put(cacheKey, JSON.stringify(data), 3600);
+            Logger.log(`[INFO] Cache miss for "${speciesName}" (${searchType}). Storing in cache.`);
+            processGoogleSearchResults(speciesName, data, resultsSheet, pricesBySpecies);
+
+            if (data.serpapi_pagination && data.serpapi_pagination.next) {
+                Logger.log(`[INFO] More results available. Fetching next page for "${speciesName}" (${searchType})`);
+                searchGoogleWithRetries(speciesName, resultsSheet, pricesBySpecies, data.serpapi_pagination.next);
+                return;
+            }
+
+            return; // Success
+
+        } catch (error) {
+            Logger.log(`[WARN] Attempt ${attempts} failed for "${speciesName}" (${searchType}): ${error.message}`);
+            if (attempts === maxAttempts) {
+                handleError(error, { speciesName, url, attempt: attempts, searchType });
+            }
+            Utilities.sleep(delay);
+            delay *= 2;
+        }
+    }
+}
+
+/**
+ * Processes all Google Search results, calls specific handlers, and collects prices.
+ */
+function processGoogleSearchResults(speciesName, data, resultsSheet, pricesBySpecies) {
+    for (const key in data) {
+        if (data.hasOwnProperty(key)) {
+            const resultType = data[key];
+            Logger.log(`[DEBUG] Found result type: ${key}`);
+
+            if (key === "organic_results") {
+                processOrganicResults(speciesName, resultType, resultsSheet, pricesBySpecies);
+            } else if (key === "ads") {
+                processAdResults(speciesName, resultType, resultsSheet, pricesBySpecies);
+            } else if (key === "inline_shopping_results") {
+                processInlineShoppingResults(speciesName, resultType, resultsSheet, pricesBySpecies);
+            } else if (key === "local_pack") {
+                processLocalPackResults(speciesName, resultType, resultsSheet, pricesBySpecies);
+            } else if (key === "knowledge_graph") {
+                processKnowledgeGraphResults(speciesName, resultType, resultsSheet);
+            } else if (key === "related_searches") {
+                processRelatedSearches(speciesName, resultType, resultsSheet);
+            } else {
+                Logger.log(`[DEBUG] Unhandled result type: ${key}`);
+            }
+        }
+    }
+}
+
+// --- Handler Functions (with Stricter Filtering) ---
+
+function processOrganicResults(speciesName, results, resultsSheet, pricesBySpecies) {
+    const keywords = generateKeywords(speciesName);
+    results.forEach(result => {
+        const title = result?.title ?? "";
+        const snippet = result?.snippet ?? "";
+
+        if (isRelevantResult(title, snippet, keywords, speciesName)) {
+            const priceRegex = /\$\d+(\.\d{2})?/;
+            let priceMatch = title.match(priceRegex) || snippet.match(priceRegex);
+            let priceVal = priceMatch ? parseFloat(priceMatch[0].replace("$", "")) : "";
+
+            if (!isNaN(priceVal)) {
+                pricesBySpecies[speciesName].push(priceVal);
+            }
+
+            let storeName = "";
+            try {
+                const url = new URL(result.link);
+                storeName = url.hostname;
+            }
+            catch(e){
+                Logger.log("[WARN] failed to parse URL: " + result.link);
+            }
+
+            const row = [
+                "Google Search (Organic)",
+                speciesName,
+                result?.position ?? "",
+                result?.title ?? "",
+                "",
+                priceVal || "",
+                "",
+                "",
+                result?.link ?? "",
+                "",
+                "",
+                "",
+                "",
+                storeName,
+                "", "", "", "", "", "", "", "", "", "", "", ""
+            ];
+            resultsSheet.appendRow(row);
+        }
+    });
+}
+
+function processAdResults(speciesName, ads, resultsSheet, pricesBySpecies) {
+    const keywords = generateKeywords(speciesName);
+    ads.forEach(ad => {
+        const title = ad?.title ?? "";
+        const snippet = ad?.snippet ?? "";
+
+        if (isRelevantResult(title, snippet, keywords, speciesName)) {
+            const priceRegex = /\$\d+(\.\d{2})?/;
+            let priceMatch = title.match(priceRegex) || snippet.match(priceRegex);
+            let priceVal = priceMatch ? parseFloat(priceMatch[0].replace("$", "")) : "";
+
+            if (!isNaN(priceVal)) {
+                pricesBySpecies[speciesName].push(priceVal);
+            }
+            let storeName = "";
+            try{
+                const url = new URL(ad.link);
+                storeName = url.hostname;
+            }
+            catch(e){
+                Logger.log("[WARN] failed to parse URL: " + ad.link);
+            }
+            const row = [
+                "Google Search (Ad)",
+                speciesName,
+                ad?.position ?? "",
+                ad?.title ?? "",
+                "",
+                priceVal || "",
+                "",
+                "",
+                ad?.link ?? "",
+                "", "", "", "",
+                storeName,
+                "", "", "", "", "", "", "", "", "", "", "", ""
+            ];
+            resultsSheet.appendRow(row);
+        }
+    });
+}
+
+function processInlineShoppingResults(speciesName, results, resultsSheet, pricesBySpecies) {
+    const keywords = generateKeywords(speciesName);
+    results.forEach(result => {
+        const title = result?.title ?? "";
+        const snippet = result?.snippet ?? ""; // Inline Shopping might have snippets
+
+        if (isRelevantResult(title, snippet, keywords, speciesName)) {
+            let priceVal = parseFloat(result?.price?.replace("$", "") || "");
+
+            if (!isNaN(priceVal)) {
+                pricesBySpecies[speciesName].push(priceVal);
+            }
+
+            const row = [
+                "Google Search (Inline Shopping)",
+                speciesName,
+                result?.position ?? "",
+                result?.title ?? "",
+                result?.price ?? "",
+                priceVal || "",
+                "",
+                "",
+                result?.link ?? "",
+                result?.product_id ?? "",
+                "", "", "",
+                result?.source ?? "",
+                "", "", "", "", "", "", "", "", "", "", "", ""
+            ];
+            resultsSheet.appendRow(row);
+        }
+    });
+}
+
+function processLocalPackResults(speciesName, results, resultsSheet, pricesBySpecies) {
+  const keywords = generateKeywords(speciesName);
+    results.forEach(result => {
+        const title = result?.title ?? "";
+        const snippet = result?.snippet ?? "";
+        if (isRelevantResult(title, snippet, keywords, speciesName)){
+            const row = [
+                "Google Search (Local Pack)",
+                speciesName,
+                result?.position ?? "",
+                result?.title ?? "",
+                "", "", "", "",
+                result?.link ?? "",
+                "", "", "", "",
+                result?.title ?? "",
+                result?.rating ?? "",
+                result?.reviews ?? "",
+                result?.thumbnail ?? "",
+                "", "", "", "", "", "", "", "", "", ""
+            ];
+            resultsSheet.appendRow(row);
+    }
+    });
+}
+
+function processKnowledgeGraphResults(speciesName, results, resultsSheet) {
+    if (results.type && results.type.toLowerCase().includes("hoya")) {
+        const row = [
+            "Google Search (Knowledge Graph)",
+            speciesName,
+            "",
+            results?.title ?? "",
+            "", "", "", "",
+            results?.link ?? "",
+            "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+            results?.description ?? "",
+            "",
+            results.image_url ?? "",
+            "",
+            ""
+        ];
+        resultsSheet.appendRow(row);
+    }
+}
+
+function processRelatedSearches(speciesName, results, resultsSheet){
+    results.forEach(result => {
+        Logger.log(`[INFO] Related Search for ${speciesName}: ${result.query}`);
+    });
+}
+
+// --- Function to Calculate and Write Metrics ---
+function calculateAndWriteMetrics(pricesBySpecies, metricsSheet) {
+    for (const species in pricesBySpecies) {
+        if (pricesBySpecies.hasOwnProperty(species)) {
+            const prices = pricesBySpecies[species];
+            const sampleCount = prices.length;
+            const mean = calculateMean(prices);
+            const percentiles = {};
+            for (let i = 0; i <= 100; i += 5) {
+                percentiles[`${i}_percentile`] = calculatePercentile(prices, i);
+            }
+
+            const row = [
+                species,
+                sampleCount,
+                mean,
+                ...Object.values(percentiles)
+            ];
+            metricsSheet.appendRow(row);
+        }
+    }
+}
